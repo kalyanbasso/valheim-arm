@@ -26,32 +26,38 @@ echo " "
 
 echo "Update"
 export SteamAppId=892970
-# SteamCMD's Oct 2026 build broke the ARM64 emulated flow:
+# SteamCMD self-updates on every start, and its Oct 2026 build broke the
+# emulated ARM64 flow:
 #  - its launcher looks for a native "linuxarm64" steamcmd, which Valve never
 #    publishes in the linux tarball
-#  - it exports an x86 LD_LIBRARY_PATH that conflicts with box32's wrapped
-#    libraries, which can make depot resolution fail ("Missing configuration")
-#  - as a 32bit client it resolves the "windows 32" depot set, so the bitness
-#    must be forced to 64
-#  - it can stall mid-download under box32 (client threads hang)
-# Workaround: on ARM64 run the 32bit binary directly through box64, without the
-# launcher script. The retry loop absorbs the internal restart request
-# (exit code 42) and stalled attempts (timeout; steamcmd resumes downloads).
-ARCH=$(dpkg --print-architecture)
-STEAMCMD_FLAGS="+@sSteamCmdForcePlatformType windows +@sSteamCmdForcePlatformBitness 64 +force_install_dir ${SERVER} +login anonymous +app_update 896660 validate +quit"
-if [ "$ARCH" = "arm64" ]; then
-    STEAMCMD_CMD="box64 /root/steamcmd/linux32/steamcmd"
+#  - running it through the launcher script fails depot resolution
+#    intermittently ("Missing configuration"); the launcher's x86
+#    LD_LIBRARY_PATH is the prime suspect (unconfirmed), and as a 32bit client
+#    it resolves the "windows 32" depot set unless bitness is forced to 64
+#  - under box32 it can stall mid-download or corrupt the heap
+#    ("malloc(): invalid size (unsorted)", "stalled cross-thread pipe")
+# Workaround: on ARM64 run the 32bit binary directly through box64, without
+# the launcher script, and retry until the server files exist. steamcmd
+# resumes partial downloads, so attempts make cumulative progress:
+#  - the timeout kills stalled attempts, absorbing the launcher's internal
+#    restart request (exit code 42) the same way
+#  - a "Missing configuration" failure can still exit 0, so success is judged
+#    by valheim_server.exe existing, not by the exit code
+#  - leftover processes are killed so two instances never fight over the
+#    download (observed to make stalls much more frequent)
+: "${STEAMCMD_ATTEMPTS:=12}"
+: "${STEAMCMD_TIMEOUT:=600}"
+STEAMCMD_FLAGS=(+@sSteamCmdForcePlatformType windows +@sSteamCmdForcePlatformBitness 64 +force_install_dir "${SERVER}" +login anonymous +app_update 896660 validate +quit)
+if [ "$(dpkg --print-architecture)" = "arm64" ]; then
+    STEAMCMD_CMD=(box64 /root/steamcmd/linux32/steamcmd)
 else
     export LD_LIBRARY_PATH="/root/steamcmd/linux32:${LD_LIBRARY_PATH:-}"
-    STEAMCMD_CMD="/root/steamcmd/linux32/steamcmd"
+    STEAMCMD_CMD=("/root/steamcmd/linux32/steamcmd")
 fi
-# The Oct 2026 steamcmd under emulation is flaky: it may request an internal
-# restart (exit 42), fail depot resolution ("Missing configuration") and still
-# exit 0, or stall mid-download (downloads resume, so keep retrying).
-for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    echo "SteamCMD attempt ${attempt}/12"
-    pkill -f "/root/steamcmd/linux32/steamcmd" 2>/dev/null
-    timeout -k 5 600 ${STEAMCMD_CMD} ${STEAMCMD_FLAGS} || true
+for attempt in $(seq 1 "${STEAMCMD_ATTEMPTS}"); do
+    echo "SteamCMD attempt ${attempt}/${STEAMCMD_ATTEMPTS}"
+    pkill -9 -f "/root/steamcmd/linux32/steamcmd" 2>/dev/null
+    timeout -k 5 "${STEAMCMD_TIMEOUT}" "${STEAMCMD_CMD[@]}" "${STEAMCMD_FLAGS[@]}" || true
     [ -f "${SERVER}/valheim_server.exe" ] && break
     sleep 5
 done
