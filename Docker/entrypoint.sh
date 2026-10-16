@@ -26,7 +26,40 @@ echo " "
 
 echo "Update"
 export SteamAppId=892970
-steamcmd.sh +@sSteamCmdForcePlatformType windows +force_install_dir ${SERVER} +login anonymous +app_update 896660 validate +quit
+# SteamCMD's Oct 2026 build broke the ARM64 emulated flow:
+#  - its launcher looks for a native "linuxarm64" steamcmd, which Valve never
+#    publishes in the linux tarball
+#  - it exports an x86 LD_LIBRARY_PATH that conflicts with box32's wrapped
+#    libraries, which can make depot resolution fail ("Missing configuration")
+#  - as a 32bit client it resolves the "windows 32" depot set, so the bitness
+#    must be forced to 64
+#  - it can stall mid-download under box32 (client threads hang)
+# Workaround: on ARM64 run the 32bit binary directly through box64, without the
+# launcher script. The retry loop absorbs the internal restart request
+# (exit code 42) and stalled attempts (timeout; steamcmd resumes downloads).
+ARCH=$(dpkg --print-architecture)
+STEAMCMD_FLAGS="+@sSteamCmdForcePlatformType windows +@sSteamCmdForcePlatformBitness 64 +force_install_dir ${SERVER} +login anonymous +app_update 896660 validate +quit"
+if [ "$ARCH" = "arm64" ]; then
+    STEAMCMD_CMD="box64 /root/steamcmd/linux32/steamcmd"
+else
+    export LD_LIBRARY_PATH="/root/steamcmd/linux32:${LD_LIBRARY_PATH:-}"
+    STEAMCMD_CMD="/root/steamcmd/linux32/steamcmd"
+fi
+# The Oct 2026 steamcmd under emulation is flaky: it may request an internal
+# restart (exit 42), fail depot resolution ("Missing configuration") and still
+# exit 0, or stall mid-download (downloads resume, so keep retrying).
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    echo "SteamCMD attempt ${attempt}/12"
+    pkill -f "/root/steamcmd/linux32/steamcmd" 2>/dev/null
+    timeout -k 5 600 ${STEAMCMD_CMD} ${STEAMCMD_FLAGS} || true
+    [ -f "${SERVER}/valheim_server.exe" ] && break
+    sleep 5
+done
+
+if [ ! -f "${SERVER}/valheim_server.exe" ]; then
+    echo "$(timestamp) ERROR: valheim_server.exe was not installed by steamcmd, aborting (check the Update log above)"
+    exit 1
+fi
 
 echo "Checking if BepInEx files need to be copied"
 mkdir -p "${SERVER}"
